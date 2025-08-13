@@ -1,0 +1,126 @@
+name: GitTogether
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "GitTogether release tag (e.g., v0.2.0). Defaults to latest version."
+        required: false
+        default: ""
+        type: string
+      release_repo:
+        description: "GitHub repository from which to download the GitTogether release."
+        required: true
+        default: "CSE-Ninja/GitTogether"
+        type: string
+      config:
+        description: "Path to the checked-in YAML config"
+        required: true
+        default: ".gittogether.yml"
+        type: string
+      output_svg:
+        description: "Path to write the SVG"
+        required: true
+        default: "activity.svg"
+        type: string
+      branch:
+        description: "Branch to publish the SVG into (force-pushed; contains ONLY the SVG)"
+        required: true
+        default: "gittogether-svg"
+        type: string
+      style:
+        description: "Render style"
+        required: true
+        default: "compact"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gittogether
+      cancel-in-progress: true
+    env:
+      REPO_SLUG: ${{ github.repository }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GT_RELEASE_REPO: ${{ inputs.release_repo }}
+      GT_VERSION: ${{ inputs.version }}
+      CONFIG_PATH: ${{ inputs.config }}
+      OUTPUT_SVG: ${{ inputs.output_svg }}
+      STYLE: ${{ inputs.style }}
+      SVG_BRANCH: ${{ inputs.branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Verify config exists
+        run: |
+          if [ ! -f "${CONFIG_PATH}" ]; then
+            echo "::error file=${CONFIG_PATH}::Config file not found."
+            exit 1
+          fi
+          echo "Using config: ${CONFIG_PATH}"
+
+      - name: Resolve GitTogether version (latest if blank)
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -z "${GT_VERSION}" ]; then
+            # Get the tag name of the latest (non-draft) release
+            resolved="$(gh release view --repo "${GT_RELEASE_REPO}" --json tagName -q .tagName)"
+            if [ -z "${resolved}" ]; then
+              echo "::error::Could not resolve latest release for ${GT_RELEASE_REPO}"
+              exit 1
+            fi
+            echo "Resolved latest release: ${resolved}"
+            echo "version=${resolved}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GT_VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download GitTogether binary
+        run: |
+          set -euo pipefail
+          ver="${{ steps.version.outputs.version }}"
+          mkdir -p .bin
+          gh release download \
+            --repo "${GT_RELEASE_REPO}" \
+            --pattern "gittogether-${ver}-linux-x86_64.tar.gz" \
+            --dir .bin
+          tar -xzf ".bin/gittogether-${ver}-linux-x86_64.tar.gz" -C .bin
+          chmod +x .bin/gittogether
+          .bin/gittogether --version || true
+
+      - name: Ensure output dir
+        run: mkdir -p "$(dirname "${OUTPUT_SVG}")"
+
+      - name: Run GitTogether
+        run: |
+          ./.bin/gittogether "${REPO_SLUG}" --config "${CONFIG_PATH}" --style "${STYLE}" -o "${OUTPUT_SVG}"
+
+      - name: Publish SVG to dedicated branch (force push, reuse checkout creds)
+        run: |
+          set -euo pipefail
+          rm -rf .svg-branch
+          git worktree add --detach .svg-branch
+          cd .svg-branch
+          git switch --orphan "${SVG_BRANCH}"
+
+          # empty tree; add only the SVG at the desired path
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          mkdir -p "$(dirname "../${OUTPUT_SVG}")" 2>/dev/null || true
+          mkdir -p "$(dirname "${OUTPUT_SVG}")"
+          cp -v "../${OUTPUT_SVG}" "${OUTPUT_SVG}"
+
+          git add "${OUTPUT_SVG}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Publish GitTogether SVG" || echo "No changes to commit."
+
+          # Push using the authenticated 'origin' from checkout (no token in URL)
+          git push -f origin "HEAD:${SVG_BRANCH}"
